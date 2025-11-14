@@ -61,9 +61,11 @@ def send_telegram_message(chat_id: int, text: str) -> None:
 
 # --- Webhook endpoint ---
 
-@app.route("/telegram-webhook", methods=["POST"])
+@app.route("/telegram-webhook", methods=["GET", "POST"])
 def telegram_webhook():
-    """Called by Telegram whenever your bot gets a message."""
+    if request.method == "GET":
+        return "Telegram webhook endpoint is live", 200
+
     update = request.get_json(force=True, silent=True)
     logger.info("Received update: %s", update)
 
