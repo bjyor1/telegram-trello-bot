@@ -10,6 +10,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TRELLO_KEY = os.environ.get("TRELLO_KEY")
 TRELLO_TOKEN = os.environ.get("TRELLO_TOKEN")
 TRELLO_CHECKLIST_ID = os.environ.get("TRELLO_CHECKLIST_ID")
+CAPTURE_SECRET = os.environ.get("CAPTURE_SECRET")
 
 if not all([TELEGRAM_BOT_TOKEN, TRELLO_KEY, TRELLO_TOKEN, TRELLO_CHECKLIST_ID]):
     raise RuntimeError("Missing one or more required environment variables")
@@ -109,6 +110,31 @@ def telegram_webhook():
         )
 
     return jsonify({"ok": True}), 200
+
+@app.route("/capture", methods=["GET", "POST"])
+def capture():
+    # GET is just for a quick browser sanity check
+    if request.method == "GET":
+        return "Capture endpoint is live", 200
+
+    # Simple auth so random people can't add tasks to your Trello
+    secret = request.headers.get("X-CAPTURE-SECRET")
+    if not CAPTURE_SECRET or secret != CAPTURE_SECRET:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    task = (data.get("task") or "").strip()
+    if not task:
+        return jsonify({"ok": False, "error": "missing task"}), 400
+
+    try:
+        trello_response = add_checkitem_to_trello(task)
+        item_name = trello_response.get("name", task)
+        return jsonify({"ok": True, "task": item_name}), 200
+    except Exception:
+        logger.exception("Failed to add checklist item from /capture")
+        return jsonify({"ok": False, "error": "trello_failed"}), 500
+
 
 
 @app.route("/", methods=["GET"])
