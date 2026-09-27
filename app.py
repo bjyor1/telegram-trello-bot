@@ -95,7 +95,7 @@ def parse_tasks(text: str) -> list[Task]:
     now = datetime.now(ZoneInfo(timezone))
     client = OpenAI()
     response = client.responses.parse(
-        model=os.getenv("OPENAI_TASK_MODEL", "gpt-6-astra"),
+        model=os.getenv("OPENAI_TASK_MODEL", "gpt-6-luna"),
         input=[
             {
                 "role": "system",
