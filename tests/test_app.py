@@ -75,3 +75,21 @@ def test_short_account_name_targets_all_items_on_card():
     plans, errors = bot.build_action_plan(batch, items, cards)
     assert errors == []
     assert len(plans[0]["items"]) == 2
+
+
+def test_bot_summary_is_never_treated_as_fresh_capture():
+    summary = """Proposed Trello changes:
+• Set ‘Book flights’ due 2026-10-29
+• Complete ‘Call Ricky’
+
+Reply ‘confirm’ to apply all changes, or ‘cancel’."""
+    assert bot.looks_like_bot_output(summary)
+    assert not bot.requests_confirmation(summary)
+
+
+def test_pasted_preview_with_confirm_is_confirmation():
+    text = """Proposed Trello changes:
+• Set ‘Book flights’ due 2026-10-29
+
+Confirm"""
+    assert bot.requests_confirmation(text)
