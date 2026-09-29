@@ -50,7 +50,22 @@ def telegram_api(method: str, **kwargs):
 
 
 def send_telegram(chat_id: int, text: str) -> None:
-    telegram_api("sendMessage", json={"chat_id": chat_id, "text": text})
+    # Telegram rejects messages longer than 4096 characters. Keep headroom and
+    # split on line boundaries so large board summaries still arrive.
+    chunks = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if current and len(current) + len(line) > 3800:
+            chunks.append(current.rstrip())
+            current = ""
+        while len(line) > 3800:
+            chunks.append(line[:3800])
+            line = line[3800:]
+        current += line
+    if current.strip():
+        chunks.append(current.rstrip())
+    for chunk in chunks or [text]:
+        telegram_api("sendMessage", json={"chat_id": chat_id, "text": chunk})
 
 
 def authorized_chat(chat_id: int) -> bool:
@@ -169,24 +184,39 @@ def card_checklists(card_id: str) -> list[dict]:
     )
 
 
+def pipeline_checklists() -> list[dict]:
+    return trello_request(
+        "GET",
+        f"/boards/{os.getenv('TRELLO_BOARD_SHORTLINK', 'MPjZR28c')}/checklists",
+        params={
+            "fields": "name,idCard",
+            "checkItems": "all",
+            "checkItem_fields": "name,state,due,idChecklist",
+        },
+    )
+
+
 def all_pipeline_items() -> list[dict]:
     items = []
-    for card in pipeline_cards():
-        for checklist in card_checklists(card["id"]):
-            for item in checklist.get("checkItems", []):
-                items.append(
-                    {
-                        "id": item["id"],
-                        "name": item["name"],
-                        "state": item.get("state", "incomplete"),
-                        "due": item.get("due"),
-                        "card_id": card["id"],
-                        "card_name": card["name"],
-                        "checklist_id": checklist["id"],
-                        "checklist_name": checklist["name"],
-                        "url": card.get("url"),
-                    }
-                )
+    cards = {card["id"]: card for card in pipeline_cards()}
+    for checklist in pipeline_checklists():
+        card = cards.get(checklist.get("idCard"))
+        if not card:
+            continue
+        for item in checklist.get("checkItems", []):
+            items.append(
+                {
+                    "id": item["id"],
+                    "name": item["name"],
+                    "state": item.get("state", "incomplete"),
+                    "due": item.get("due"),
+                    "card_id": card["id"],
+                    "card_name": card["name"],
+                    "checklist_id": checklist["id"],
+                    "checklist_name": checklist["name"],
+                    "url": card.get("url"),
+                }
+            )
     return items
 
 
@@ -199,18 +229,32 @@ def item_due(item: dict) -> date | None:
 def work_summary() -> str:
     today = datetime.now(ZoneInfo(os.getenv("BOT_TIMEZONE", "Australia/Melbourne"))).date()
     items = [i for i in all_pipeline_items() if i["state"] != "complete"]
-    overdue = [i for i in items if item_due(i) and item_due(i) < today]
-    due_today = [i for i in items if item_due(i) == today]
+    overdue = sorted(
+        (i for i in items if item_due(i) and item_due(i) < today),
+        key=item_due,
+    )
+    due_today = sorted(
+        (i for i in items if item_due(i) == today), key=lambda i: i["card_name"]
+    )
     inbox = [i for i in items if i["card_name"].strip().upper() == "INBOX BOT"]
-    upcoming = [i for i in items if item_due(i) and today < item_due(i) <= today + timedelta(days=7)]
+    upcoming = sorted(
+        (i for i in items if item_due(i) and today < item_due(i) <= today + timedelta(days=7)),
+        key=item_due,
+    )
 
     def lines(group):
-        return [f"• {i['name']} — {i['card_name']} ({i['url']})" for i in group]
+        return [
+            f"• {i['name']} — {i['card_name']}"
+            + (f" — {item_due(i).isoformat()}" if item_due(i) else " — no date")
+            for i in group
+        ]
 
     out = [f"PIPELINE work brief — {today.isoformat()}"]
     for label, group in (("OVERDUE", overdue), ("DUE TODAY", due_today), ("INBOX BOT", inbox), ("NEXT 7 DAYS", upcoming)):
         out.append(f"\n{label} ({len(group)})")
-        out.extend(lines(group[:15]) or ["• None"])
+        out.extend(lines(group[:10]) or ["• None"])
+        if len(group) > 10:
+            out.append(f"• …and {len(group) - 10} more")
     return "\n".join(out)
 
 
@@ -447,4 +491,3 @@ def telegram_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
-
