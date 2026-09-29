@@ -3,6 +3,8 @@ import os
 import re
 import tempfile
 from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import requests
@@ -15,7 +17,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("brad-bot")
 
 app = Flask(__name__)
-PENDING_ACTIONS: dict[int, tuple[str, dict]] = {}
+PENDING_ACTIONS: dict[int, dict] = {}
 
 
 class Task(BaseModel):
@@ -28,6 +30,21 @@ class Task(BaseModel):
 
 class TaskBatch(BaseModel):
     tasks: list[Task] = Field(min_length=1, max_length=20)
+
+
+class BoardAction(BaseModel):
+    action: Literal["move", "set_due", "complete", "create"]
+    query: str | None = None
+    scope: Literal["single", "all_matching", "inbox_all"] = "single"
+    target_card: str | None = None
+    title: str | None = None
+    reference_query: str | None = None
+    due_date: str | None = None
+    offset_days: int | None = None
+
+
+class BoardActionBatch(BaseModel):
+    actions: list[BoardAction] = Field(min_length=1, max_length=30)
 
 
 def env(name: str, required: bool = True) -> str | None:
@@ -277,12 +294,237 @@ def parse_requested_date(text: str) -> str | None:
     return None
 
 
+def looks_like_board_command(text: str) -> bool:
+    lower = text.lower()
+    signals = (
+        "tick complete",
+        "mark complete",
+        "push all",
+        "move all",
+        "set another checklist",
+        "move the due date",
+        "change the due date",
+    )
+    action_lines = sum(
+        1
+        for line in text.splitlines()
+        if line.strip().lower().startswith(("move ", "push ", "tick ", "mark ", "set ", "create "))
+    )
+    return action_lines > 1 or any(signal in lower for signal in signals)
+
+
+def parse_board_actions(text: str, card_names: list[str]) -> BoardActionBatch:
+    timezone = ZoneInfo(os.getenv("BOT_TIMEZONE", "Australia/Melbourne"))
+    now = datetime.now(timezone)
+    client = OpenAI()
+    return client.responses.parse(
+        model=os.getenv("OPENAI_TASK_MODEL", "gpt-6-luna"),
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "Convert Trello instructions into ordered structured actions. "
+                    "A user may call checklist items 'cards' or 'stuff'. "
+                    "Use move for moving checklist items to another card, set_due for date changes, "
+                    "complete for ticking items complete, and create for a new checklist item. "
+                    "Use scope=inbox_all for all items from INBOX or INBOX BOT; use all_matching for "
+                    "phrases like all JBS MISO items; otherwise single. Preserve short identifying "
+                    "phrases in query. For create-on-that-card instructions, put the prior item phrase "
+                    "in reference_query. Resolve explicit dates to YYYY-MM-DD using the local time. "
+                    "For relative durations such as two weeks, set offset_days. Never invent an action, "
+                    "destination, title, or date."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Local time: {now.isoformat()}\n"
+                    f"Existing card names: {card_names}\n"
+                    f"Instructions:\n{text}"
+                ),
+            },
+        ],
+        text_format=BoardActionBatch,
+    ).output_parsed
+
+
+def normalized_words(value: str) -> list[str]:
+    ignored = {"all", "the", "one", "items", "item", "stuff", "card", "cards", "on", "for"}
+    return [word for word in re.findall(r"[a-z0-9]+", value.lower()) if word not in ignored]
+
+
+def resolve_items(query: str | None, scope: str, items: list[dict]) -> tuple[list[dict], str | None]:
+    incomplete = [item for item in items if item["state"] != "complete"]
+    if scope == "inbox_all":
+        matches = [item for item in incomplete if item["card_name"].strip().upper() == "INBOX BOT"]
+        return matches, None if matches else "No incomplete items were found on INBOX BOT."
+    if not query:
+        return [], "An item description is missing."
+    words = normalized_words(query)
+    if not words:
+        return [], f"‘{query}’ is too vague to match safely."
+    candidates = []
+    for item in incomplete:
+        haystack = f"{item['name']} {item['card_name']}".lower()
+        if all(word in haystack for word in words):
+            candidates.append(item)
+    if scope == "all_matching":
+        return candidates, None if candidates else f"No items matched ‘{query}’."
+    if len(candidates) == 1:
+        return candidates, None
+    if not candidates:
+        return [], f"No item matched ‘{query}’."
+    needle = " ".join(words)
+    ranked = sorted(
+        candidates,
+        key=lambda item: SequenceMatcher(None, needle, f"{item['name']} {item['card_name']}".lower()).ratio(),
+        reverse=True,
+    )
+    return [], f"‘{query}’ matched {len(ranked)} items; include more of the item name."
+
+
+def resolve_card(query: str | None, cards: list[dict]) -> tuple[dict | None, str | None]:
+    if not query:
+        return None, "A destination card is missing."
+    needle = query.strip().lower()
+    open_cards = [card for card in cards if not card.get("closed")]
+    exact = [card for card in open_cards if card["name"].lower() == needle]
+    if exact:
+        return exact[0], None
+    partial = [card for card in open_cards if needle in card["name"].lower()]
+    if len(partial) == 1:
+        return partial[0], None
+    return None, f"Destination ‘{query}’ did not uniquely match a card."
+
+
+def action_due(action: BoardAction) -> str | None:
+    if action.due_date:
+        return action.due_date
+    if action.offset_days is not None:
+        timezone = ZoneInfo(os.getenv("BOT_TIMEZONE", "Australia/Melbourne"))
+        return (datetime.now(timezone).date() + timedelta(days=action.offset_days)).isoformat()
+    return None
+
+
+def build_action_plan(batch: BoardActionBatch, items: list[dict], cards: list[dict]) -> tuple[list[dict], list[str]]:
+    plans = []
+    errors = []
+    previous_items: list[dict] = []
+    for action in batch.actions:
+        query = action.reference_query if action.action == "create" else action.query
+        matches, error = resolve_items(query, action.scope, items)
+        if action.action == "create" and not matches and previous_items and not action.reference_query:
+            matches, error = previous_items[-1:], None
+        if error:
+            errors.append(error)
+            continue
+        due = action_due(action)
+        if action.action in {"move", "set_due", "create"} and not due:
+            errors.append(f"No due date was supplied for ‘{action.query or action.title or 'new item'}’. ")
+            continue
+        target = None
+        if action.action == "move":
+            target, error = resolve_card(action.target_card, cards)
+            if error:
+                errors.append(error)
+                continue
+        if action.action == "create" and not action.title:
+            errors.append("A new checklist item was requested without a title.")
+            continue
+        plans.append({"action": action.action, "items": matches, "target": target, "title": action.title, "due": due})
+        if matches:
+            previous_items = matches
+    return plans, errors
+
+
+def plan_preview(plans: list[dict]) -> str:
+    lines = ["Proposed Trello changes:"]
+    for plan in plans:
+        names = ", ".join(f"‘{item['name']}’" for item in plan["items"][:3])
+        if len(plan["items"]) > 3:
+            names += f" and {len(plan['items']) - 3} more"
+        if plan["action"] == "move":
+            lines.append(f"• Move {names} to {plan['target']['name']}; due {plan['due']}")
+        elif plan["action"] == "set_due":
+            lines.append(f"• Set {names} due {plan['due']}")
+        elif plan["action"] == "complete":
+            lines.append(f"• Complete {names}")
+        else:
+            lines.append(f"• Create ‘{plan['title']}’ on {plan['items'][0]['card_name']}; due {plan['due']}")
+    lines.append("\nReply ‘confirm’ to apply all changes, or ‘cancel’. ")
+    return "\n".join(lines)
+
+
 def update_checkitem(item: dict, due_date: str) -> None:
     trello_request(
         "PUT",
         f"/cards/{item['card_id']}/checkItem/{item['id']}",
         params={"due": f"{due_date}T23:59:00.000Z"},
     )
+
+
+def complete_checkitem(item: dict) -> None:
+    trello_request(
+        "PUT",
+        f"/cards/{item['card_id']}/checkItem/{item['id']}",
+        params={"state": "complete"},
+    )
+
+
+def create_followup(reference_item: dict, title: str, due_date: str) -> None:
+    trello_request(
+        "POST",
+        f"/checklists/{reference_item['checklist_id']}/checkItems",
+        params={
+            "name": title,
+            "pos": "top",
+            "due": f"{due_date}T23:59:00.000Z",
+        },
+    )
+
+
+def execute_action_plans(plans: list[dict]) -> str:
+    completed = 0
+    failed = []
+    for plan in plans:
+        if plan["action"] == "move":
+            for item in plan["items"]:
+                try:
+                    move_item(item, plan["target"], plan["due"])
+                    completed += 1
+                except Exception:
+                    logger.exception("Batch move failed for %s", item["name"])
+                    failed.append(item["name"])
+        elif plan["action"] == "set_due":
+            for item in plan["items"]:
+                try:
+                    update_checkitem(item, plan["due"])
+                    completed += 1
+                except Exception:
+                    logger.exception("Batch due-date update failed for %s", item["name"])
+                    failed.append(item["name"])
+        elif plan["action"] == "complete":
+            for item in plan["items"]:
+                try:
+                    complete_checkitem(item)
+                    completed += 1
+                except Exception:
+                    logger.exception("Batch completion failed for %s", item["name"])
+                    failed.append(item["name"])
+        elif plan["action"] == "create":
+            try:
+                create_followup(plan["items"][0], plan["title"], plan["due"])
+                completed += 1
+            except Exception:
+                logger.exception("Batch create failed for %s", plan["title"])
+                failed.append(plan["title"])
+    result = f"Applied {completed} Trello change{'s' if completed != 1 else ''}."
+    if failed:
+        result += f" {len(failed)} failed: " + ", ".join(failed[:5])
+        if len(failed) > 5:
+            result += f" and {len(failed) - 5} more"
+        result += ". Check those items in Trello before retrying."
+    return result
 
 
 def find_item(query: str) -> dict | None:
@@ -335,8 +577,10 @@ def handle_trello_command(text: str, chat_id: int | None = None) -> str | None:
         pending = PENDING_ACTIONS.pop(chat_id, None)
         if not pending:
             return "There is no pending Trello change to confirm."
-        action, data = pending
-        if action == "date":
+        if pending["kind"] == "batch":
+            return execute_action_plans(pending["plans"])
+        data = pending["data"]
+        if pending["kind"] == "date":
             update_checkitem(data["item"], data["due"])
             return f"Updated ‘{data['item']['name']}’ on {data['item']['card_name']} to {data['due']}."
         move_item(data["item"], data["target"], data["due"])
@@ -350,6 +594,21 @@ def handle_trello_command(text: str, chat_id: int | None = None) -> str | None:
     ):
         return work_summary()
 
+    if looks_like_board_command(text):
+        cards = pipeline_cards()
+        batch = parse_board_actions(text, [card["name"] for card in cards])
+        if not batch:
+            return "I couldn’t parse those Trello instructions. Nothing was changed."
+        plans, errors = build_action_plan(batch, all_pipeline_items(), cards)
+        if errors:
+            details = "\n".join(f"• {error}" for error in errors)
+            preview = plan_preview(plans) + "\n\n" if plans else ""
+            return preview + "I need clarification before I can safely apply the batch:\n" + details
+        if chat_id is None:
+            return plan_preview(plans)
+        PENDING_ACTIONS[chat_id] = {"kind": "batch", "plans": plans}
+        return plan_preview(plans)
+
     if lower.startswith(("push ", "move the due date", "change the due date")):
         due = parse_requested_date(text)
         if not due:
@@ -362,7 +621,7 @@ def handle_trello_command(text: str, chat_id: int | None = None) -> str | None:
             return "I couldn’t uniquely identify that checklist item. Include a few more words from its exact name."
         if chat_id is None:
             return "I found the item, but I need Telegram confirmation before changing Trello."
-        PENDING_ACTIONS[chat_id] = ("date", {"item": item, "due": due})
+        PENDING_ACTIONS[chat_id] = {"kind": "date", "data": {"item": item, "due": due}}
         return f"I’ll change ‘{item['name']}’ on {item['card_name']} to {due}. Reply ‘confirm’ to apply it."
 
     if lower.startswith("move "):
@@ -379,11 +638,14 @@ def handle_trello_command(text: str, chat_id: int | None = None) -> str | None:
         if item["card_id"] == target["id"]:
             if chat_id is None:
                 return "I found the item, but I need Telegram confirmation before changing Trello."
-            PENDING_ACTIONS[chat_id] = ("date", {"item": item, "due": due})
+            PENDING_ACTIONS[chat_id] = {"kind": "date", "data": {"item": item, "due": due}}
             return f"That item is already on {target['name']}. I’ll set it due {due}. Reply ‘confirm’ to apply it."
         if chat_id is None:
             return "I found the item and destination, but I need Telegram confirmation before moving it."
-        PENDING_ACTIONS[chat_id] = ("move", {"item": item, "target": target, "due": due})
+        PENDING_ACTIONS[chat_id] = {
+            "kind": "move",
+            "data": {"item": item, "target": target, "due": due},
+        }
         return f"I’ll move ‘{item['name']}’ from {item['card_name']} to {target['name']} and set it due {due}. Reply ‘confirm’ to apply it."
     return None
 
@@ -469,6 +731,19 @@ def telegram_webhook():
         if not text:
             send_telegram(chat_id, "Send me text or a voice note and I’ll capture it.")
             return jsonify(ok=True)
+
+        lower_text = text.lower()
+        if looks_like_board_command(text) or any(
+            phrase in lower_text
+            for phrase in (
+                "what do i need to work on",
+                "what should i work on",
+                "anything urgent",
+                "what's outstanding",
+                "whats outstanding",
+            )
+        ):
+            send_telegram(chat_id, "Checking PIPELINE…")
 
         command_response = handle_trello_command(text, chat_id)
         if command_response:
