@@ -359,6 +359,33 @@ def looks_like_board_command(text: str) -> bool:
     return action_lines > 1 or any(signal in lower for signal in signals)
 
 
+def looks_like_bot_output(text: str) -> bool:
+    lower = text.lower()
+    markers = (
+        "proposed trello changes:",
+        "pipeline work brief",
+        "reply ‘confirm’ to apply",
+        "reply 'confirm' to apply",
+        "captured ",
+        "i need clarification before i can safely apply the batch:",
+    )
+    bullet_due_lines = sum(
+        1
+        for line in text.splitlines()
+        if line.strip().startswith(("•", "✓")) and (" due " in line.lower() or " — " in line)
+    )
+    return any(marker in lower for marker in markers) or bullet_due_lines >= 2
+
+
+def requests_confirmation(text: str) -> bool:
+    lower = text.lower().strip()
+    if lower in {"yes", "confirm", "confirmed", "y", "/confirm"}:
+        return True
+    # Handles a pasted/quoted preview followed by Confirm without treating all
+    # of the quoted checklist lines as new task captures.
+    return looks_like_bot_output(text) and bool(re.search(r"(?:^|\n)\s*confirm(?:ed)?\s*$", lower))
+
+
 def parse_board_actions(text: str, card_names: list[str]) -> BoardActionBatch:
     timezone = ZoneInfo(os.getenv("BOT_TIMEZONE", "Australia/Melbourne"))
     now = datetime.now(timezone)
@@ -689,7 +716,7 @@ def move_item(item: dict, target_card: dict, due_date: str) -> None:
 
 def handle_trello_command(text: str, chat_id: int | None = None) -> str | None:
     lower = text.lower().strip()
-    if chat_id and lower in {"yes", "confirm", "y", "/confirm"}:
+    if chat_id and requests_confirmation(text):
         pending = PENDING_ACTIONS.pop(chat_id, None)
         if not pending:
             return "There is no pending Trello change to confirm."
@@ -865,6 +892,14 @@ def telegram_webhook():
         command_response = handle_trello_command(text, chat_id)
         if command_response:
             send_telegram(chat_id, command_response)
+            return jsonify(ok=True)
+
+        if looks_like_bot_output(text):
+            send_telegram(
+                chat_id,
+                "That looks like text from one of my own Trello summaries, so I did not capture it as new tasks. "
+                "Send only ‘confirm’ to approve a pending change.",
+            )
             return jsonify(ok=True)
 
         tasks = capture(text)
