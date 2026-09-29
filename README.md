@@ -11,6 +11,8 @@ A drop-in upgrade for the existing Flask/Render Telegram → Trello capture bot.
 - Falls back to saving the original text if AI parsing fails.
 - Restricts Telegram use to one chat ID when configured.
 - Verifies Telegram's webhook secret when configured.
+- Answers work-queue questions from the `PIPELINE` board (overdue, today, inbox, and upcoming).
+- Updates native Trello checklist due dates from Telegram commands.
 
 This first version deliberately does **not** send email, alter calendars, delete
 data, or autonomously reprioritize tasks.
@@ -21,6 +23,8 @@ data, or autonomously reprioritize tasks.
 2. Keep the existing Trello, Telegram, and `CAPTURE_SECRET` environment values.
 3. Add the new values from `.env.example`: `OPENAI_API_KEY`,
    `TELEGRAM_ALLOWED_CHAT_ID`, `TELEGRAM_WEBHOOK_SECRET`, and `BOT_TIMEZONE`.
+   Set `TRELLO_BOARD_SHORTLINK=MPjZR28c` for the `PIPELINE` board (this is the
+   default if omitted).
 4. Use build command `pip install -r requirements.txt`.
 5. Use start command `gunicorn app:app`.
 
@@ -54,6 +58,14 @@ pytest -q
 
 ## Recommended next step
 
-After a week of real use, graduate checklist items into Trello cards with native
-due dates, labels, account tags, and an Inbox → triage workflow. Calendar and
-email should come later and require explicit approval before changes or sends.
+Telegram examples:
+
+```text
+What do I need to work on today?
+What is overdue or urgent?
+Push Send Arcosa proposal to next Monday.
+```
+
+Cross-card inbox moves are the next addition; they should create and verify the
+destination item before removing the source item.
+
