@@ -1,7 +1,8 @@
 import logging
 import os
+import re
 import tempfile
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -14,6 +15,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("brad-bot")
 
 app = Flask(__name__)
+PENDING_ACTIONS: dict[int, tuple[str, dict]] = {}
 
 
 class Task(BaseModel):
@@ -139,6 +141,209 @@ def add_checkitem_to_trello(task: Task) -> None:
     response.raise_for_status()
 
 
+def trello_request(method: str, path: str, **kwargs):
+    params = kwargs.pop("params", {})
+    params.update({"key": env("TRELLO_KEY"), "token": env("TRELLO_TOKEN")})
+    response = requests.request(
+        method, f"https://api.trello.com/1{path}", params=params, timeout=30, **kwargs
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def pipeline_board() -> dict:
+    return trello_request("GET", f"/boards/{os.getenv('TRELLO_BOARD_SHORTLINK', 'MPjZR28c')}", params={"fields": "name"})
+
+
+def pipeline_cards() -> list[dict]:
+    return trello_request(
+        "GET",
+        f"/boards/{os.getenv('TRELLO_BOARD_SHORTLINK', 'MPjZR28c')}/cards",
+        params={"fields": "name,idList,url,due,closed"},
+    )
+
+
+def card_checklists(card_id: str) -> list[dict]:
+    return trello_request(
+        "GET", f"/cards/{card_id}/checklists", params={"checkItems": "true"}
+    )
+
+
+def all_pipeline_items() -> list[dict]:
+    items = []
+    for card in pipeline_cards():
+        for checklist in card_checklists(card["id"]):
+            for item in checklist.get("checkItems", []):
+                items.append(
+                    {
+                        "id": item["id"],
+                        "name": item["name"],
+                        "state": item.get("state", "incomplete"),
+                        "due": item.get("due"),
+                        "card_id": card["id"],
+                        "card_name": card["name"],
+                        "checklist_id": checklist["id"],
+                        "checklist_name": checklist["name"],
+                        "url": card.get("url"),
+                    }
+                )
+    return items
+
+
+def item_due(item: dict) -> date | None:
+    if not item.get("due"):
+        return None
+    return datetime.fromisoformat(item["due"].replace("Z", "+00:00")).date()
+
+
+def work_summary() -> str:
+    today = datetime.now(ZoneInfo(os.getenv("BOT_TIMEZONE", "Australia/Melbourne"))).date()
+    items = [i for i in all_pipeline_items() if i["state"] != "complete"]
+    overdue = [i for i in items if item_due(i) and item_due(i) < today]
+    due_today = [i for i in items if item_due(i) == today]
+    inbox = [i for i in items if i["card_name"].strip().upper() == "INBOX BOT"]
+    upcoming = [i for i in items if item_due(i) and today < item_due(i) <= today + timedelta(days=7)]
+
+    def lines(group):
+        return [f"• {i['name']} — {i['card_name']} ({i['url']})" for i in group]
+
+    out = [f"PIPELINE work brief — {today.isoformat()}"]
+    for label, group in (("OVERDUE", overdue), ("DUE TODAY", due_today), ("INBOX BOT", inbox), ("NEXT 7 DAYS", upcoming)):
+        out.append(f"\n{label} ({len(group)})")
+        out.extend(lines(group[:15]) or ["• None"])
+    return "\n".join(out)
+
+
+def parse_requested_date(text: str) -> str | None:
+    timezone = ZoneInfo(os.getenv("BOT_TIMEZONE", "Australia/Melbourne"))
+    today = datetime.now(timezone).date()
+    lower = text.lower()
+    if "today" in lower:
+        return today.isoformat()
+    if "tomorrow" in lower:
+        return (today + timedelta(days=1)).isoformat()
+    match = re.search(r"(20\d{2}-\d{2}-\d{2})", lower)
+    if match:
+        return match.group(1)
+    weekdays = {name.lower(): idx for idx, name in enumerate(("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"))}
+    for name, idx in weekdays.items():
+        if name in lower:
+            delta = (idx - today.weekday()) % 7 or 7
+            return (today + timedelta(days=delta)).isoformat()
+    return None
+
+
+def update_checkitem(item: dict, due_date: str) -> None:
+    trello_request(
+        "PUT",
+        f"/cards/{item['card_id']}/checkItem/{item['id']}",
+        params={"due": f"{due_date}T23:59:00.000Z"},
+    )
+
+
+def find_item(query: str) -> dict | None:
+    query = query.strip().lower()
+    items = [i for i in all_pipeline_items() if i["state"] != "complete"]
+    exact = [i for i in items if i["name"].lower() == query]
+    if exact:
+        return exact[0]
+    matches = [i for i in items if query in i["name"].lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def find_card(query: str) -> dict | None:
+    query = query.strip().lower()
+    cards = [c for c in pipeline_cards() if not c.get("closed")]
+    exact = [c for c in cards if c["name"].lower() == query]
+    if exact:
+        return exact[0]
+    matches = [c for c in cards if query in c["name"].lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def move_item(item: dict, target_card: dict, due_date: str) -> None:
+    checklists = card_checklists(target_card["id"])
+    if not checklists:
+        raise RuntimeError(f"Target card {target_card['name']} has no checklist")
+    target_checklist = checklists[0]
+    created = trello_request(
+        "POST",
+        f"/checklists/{target_checklist['id']}/checkItems",
+        params={
+            "name": item["name"],
+            "pos": "top",
+            "due": f"{due_date}T23:59:00.000Z",
+        },
+    )
+    try:
+        trello_request(
+            "DELETE",
+            f"/cards/{item['card_id']}/checkItem/{item['id']}",
+        )
+    except Exception:
+        logger.exception("Created destination item %s but could not remove source", created)
+        raise
+
+
+def handle_trello_command(text: str, chat_id: int | None = None) -> str | None:
+    lower = text.lower().strip()
+    if chat_id and lower in {"yes", "confirm", "y", "/confirm"}:
+        pending = PENDING_ACTIONS.pop(chat_id, None)
+        if not pending:
+            return "There is no pending Trello change to confirm."
+        action, data = pending
+        if action == "date":
+            update_checkitem(data["item"], data["due"])
+            return f"Updated ‘{data['item']['name']}’ on {data['item']['card_name']} to {data['due']}."
+        move_item(data["item"], data["target"], data["due"])
+        return f"Moved ‘{data['item']['name']}’ from {data['item']['card_name']} to {data['target']['name']} and set it due {data['due']}."
+    if chat_id and lower in {"no", "cancel", "/cancel"}:
+        PENDING_ACTIONS.pop(chat_id, None)
+        return "Cancelled. Nothing was changed in Trello."
+    if lower in {"/today", "/work", "/brief"} or any(
+        phrase in lower
+        for phrase in ("what do i need to work on", "what should i work on", "anything urgent", "what's outstanding", "whats outstanding")
+    ):
+        return work_summary()
+
+    if lower.startswith(("push ", "move the due date", "change the due date")):
+        due = parse_requested_date(text)
+        if not due:
+            return "Tell me the new date, for example: ‘Push Send proposal to next Monday.’"
+        cleaned = re.sub(r"\b(today|tomorrow|next\s+\w+|20\d{2}-\d{2}-\d{2})\b", "", text, flags=re.I)
+        cleaned = re.sub(r"^(push|move the due date|change the due date)\s+", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s+(to|until|out)\s*$", "", cleaned, flags=re.I).strip(" .")
+        item = find_item(cleaned)
+        if not item:
+            return "I couldn’t uniquely identify that checklist item. Include a few more words from its exact name."
+        if chat_id is None:
+            return "I found the item, but I need Telegram confirmation before changing Trello."
+        PENDING_ACTIONS[chat_id] = ("date", {"item": item, "due": due})
+        return f"I’ll change ‘{item['name']}’ on {item['card_name']} to {due}. Reply ‘confirm’ to apply it."
+
+    if lower.startswith("move "):
+        due = parse_requested_date(text)
+        if not due:
+            return "I need a due date before moving an item. Try: ‘Move X to Arcosa, due Friday.’"
+        match = re.match(r"move\s+(.+?)\s+to\s+(.+?)(?:,?\s+(?:due|on|for)\s+.+)?$", text, re.I)
+        if not match:
+            return "Try: ‘Move Send proposal to Arcosa, due Friday.’"
+        item = find_item(match.group(1))
+        target = find_card(match.group(2))
+        if not item or not target:
+            return "I couldn’t uniquely identify both the checklist item and destination card."
+        if item["card_id"] == target["id"]:
+            if chat_id is None:
+                return "I found the item, but I need Telegram confirmation before changing Trello."
+            PENDING_ACTIONS[chat_id] = ("date", {"item": item, "due": due})
+            return f"That item is already on {target['name']}. I’ll set it due {due}. Reply ‘confirm’ to apply it."
+        if chat_id is None:
+            return "I found the item and destination, but I need Telegram confirmation before moving it."
+        PENDING_ACTIONS[chat_id] = ("move", {"item": item, "target": target, "due": due})
+        return f"I’ll move ‘{item['name']}’ from {item['card_name']} to {target['name']} and set it due {due}. Reply ‘confirm’ to apply it."
+    return None
+
+
 def capture(text: str) -> list[Task]:
     text = (text or "").strip()
     if not text:
@@ -210,7 +415,8 @@ def telegram_webhook():
         if text and text.strip().startswith("/start"):
             send_telegram(
                 chat_id,
-                "Send me text or a voice note and I’ll turn it into Trello tasks.",
+                "I can capture tasks, brief you on PIPELINE, and update Trello.\n\n"
+                "Try: ‘What do I need to work on today?’ or ‘Push Send proposal to next Monday.’",
             )
             return jsonify(ok=True)
         if not text and message.get("voice"):
@@ -218,6 +424,11 @@ def telegram_webhook():
             text = transcribe_voice(temp_path)
         if not text:
             send_telegram(chat_id, "Send me text or a voice note and I’ll capture it.")
+            return jsonify(ok=True)
+
+        command_response = handle_trello_command(text, chat_id)
+        if command_response:
+            send_telegram(chat_id, command_response)
             return jsonify(ok=True)
 
         tasks = capture(text)
@@ -236,3 +447,4 @@ def telegram_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
