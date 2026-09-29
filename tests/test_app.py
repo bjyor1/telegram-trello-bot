@@ -93,3 +93,10 @@ def test_pasted_preview_with_confirm_is_confirmation():
 
 Confirm"""
     assert bot.requests_confirmation(text)
+
+
+def test_telegram_capture_requires_explicit_prefix():
+    assert bot.telegram_capture_text("Call John tomorrow") is None
+    assert bot.telegram_capture_text("/add Call John tomorrow") == "Call John tomorrow"
+    assert bot.telegram_capture_text("add task: Call John tomorrow") == "Call John tomorrow"
+    assert bot.telegram_capture_text("Capture: Call John tomorrow") == "Call John tomorrow"
