@@ -39,3 +39,39 @@ def test_browser_sanity_checks():
     client = bot.app.test_client()
     assert client.get("/capture").status_code == 200
     assert client.get("/telegram-webhook").status_code == 200
+
+
+def test_matching_tolerates_synonyms_typos_and_accents():
+    items = [
+        {
+            "id": "1",
+            "name": "Chase up Ricky for bills",
+            "card_name": "Personal",
+            "state": "incomplete",
+        },
+        {
+            "id": "2",
+            "name": "pre Catherine",
+            "card_name": "Sales",
+            "state": "incomplete",
+        },
+    ]
+    ricky, error = bot.resolve_items("ask Ricky for bills", "single", items)
+    assert error is None
+    assert ricky[0]["id"] == "1"
+    catherine, error = bot.resolve_items("prep Catherine", "single", items)
+    assert error is None
+    assert catherine[0]["id"] == "2"
+    assert bot.normalized_text("Transcendía") == "transcendia"
+
+
+def test_short_account_name_targets_all_items_on_card():
+    cards = [{"id": "card-1", "name": "Transcendia", "closed": False}]
+    items = [
+        {"id": "1", "name": "Email Shelley", "card_name": "Transcendia", "card_id": "card-1", "state": "incomplete"},
+        {"id": "2", "name": "Research forced curtailment", "card_name": "Transcendia", "card_id": "card-1", "state": "incomplete"},
+    ]
+    batch = bot.BoardActionBatch(actions=[bot.BoardAction(action="set_due", query="Transcendía", due_date="2026-10-29")])
+    plans, errors = bot.build_action_plan(batch, items, cards)
+    assert errors == []
+    assert len(plans[0]["items"]) == 2
