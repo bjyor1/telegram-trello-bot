@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import tempfile
+import unicodedata
 from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Literal
@@ -253,11 +254,11 @@ def work_summary() -> str:
     due_today = sorted(
         (i for i in items if item_due(i) == today), key=lambda i: i["card_name"]
     )
-    inbox = [i for i in items if i["card_name"].strip().upper() == "INBOX BOT"]
-    upcoming = sorted(
-        (i for i in items if item_due(i) and today < item_due(i) <= today + timedelta(days=7)),
-        key=item_due,
-    )
+    inbox = [
+        i
+        for i in items
+        if i["card_name"].strip().upper() == "INBOX BOT" and not item_due(i)
+    ]
 
     def lines(group):
         return [
@@ -267,7 +268,11 @@ def work_summary() -> str:
         ]
 
     out = [f"PIPELINE work brief — {today.isoformat()}"]
-    for label, group in (("OVERDUE", overdue), ("DUE TODAY", due_today), ("INBOX BOT", inbox), ("NEXT 7 DAYS", upcoming)):
+    for label, group in (
+        ("OVERDUE", overdue),
+        ("DUE TODAY", due_today),
+        ("INBOX BOT — NO DATE", inbox),
+    ):
         out.append(f"\n{label} ({len(group)})")
         out.extend(lines(group[:10]) or ["• None"])
         if len(group) > 10:
@@ -286,12 +291,53 @@ def parse_requested_date(text: str) -> str | None:
     match = re.search(r"(20\d{2}-\d{2}-\d{2})", lower)
     if match:
         return match.group(1)
+    month_names = {
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+    month_match = re.search(
+        r"\b(" + "|".join(month_names) + r")\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(20\d{2}))?\b",
+        lower,
+    )
+    if month_match:
+        year = int(month_match.group(3) or today.year)
+        resolved = date(year, month_names[month_match.group(1)], int(month_match.group(2)))
+        if not month_match.group(3) and resolved < today:
+            resolved = date(year + 1, resolved.month, resolved.day)
+        return resolved.isoformat()
+    weeks_match = re.search(r"\b(one|two|three|\d+)\s+weeks?\b", lower)
+    if weeks_match:
+        word_numbers = {"one": 1, "two": 2, "three": 3}
+        weeks = word_numbers.get(weeks_match.group(1), int(weeks_match.group(1)) if weeks_match.group(1).isdigit() else 0)
+        return (today + timedelta(weeks=weeks)).isoformat()
     weekdays = {name.lower(): idx for idx, name in enumerate(("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"))}
     for name, idx in weekdays.items():
         if name in lower:
             delta = (idx - today.weekday()) % 7 or 7
             return (today + timedelta(days=delta)).isoformat()
     return None
+
+
+def repair_missing_action_dates(batch: BoardActionBatch, original_text: str) -> None:
+    segments = [segment.strip() for segment in re.split(r"[\n.]+", original_text) if segment.strip()]
+    for action in batch.actions:
+        if action.due_date or action.offset_days is not None or action.action not in {"move", "set_due", "create"}:
+            continue
+        query = action.query or action.reference_query or action.target_card or ""
+        query_words = set(normalized_words(query))
+        best_segment = None
+        best_overlap = -1
+        for segment in segments:
+            segment_words = set(normalized_words(segment))
+            overlap = len(query_words & segment_words)
+            if action.scope == "inbox_all" and "inbox" in segment.lower():
+                overlap += 10
+            if overlap > best_overlap and parse_requested_date(segment):
+                best_segment = segment
+                best_overlap = overlap
+        if best_segment:
+            action.due_date = parse_requested_date(best_segment)
 
 
 def looks_like_board_command(text: str) -> bool:
@@ -325,14 +371,23 @@ def parse_board_actions(text: str, card_names: list[str]) -> BoardActionBatch:
                 "content": (
                     "Convert Trello instructions into ordered structured actions. "
                     "A user may call checklist items 'cards' or 'stuff'. "
+                    "Every date refers to a checklist-item due date; never create or update a Trello card due date. "
                     "Use move for moving checklist items to another card, set_due for date changes, "
                     "complete for ticking items complete, and create for a new checklist item. "
                     "Use scope=inbox_all for all items from INBOX or INBOX BOT; use all_matching for "
-                    "phrases like all JBS MISO items; otherwise single. Preserve short identifying "
+                    "phrases like all JBS MISO items. If a short query is an account/card name such as "
+                    "Transcendia or JBS MISO, use all_matching because it means every incomplete checklist "
+                    "item on that account card. Otherwise use single. Preserve short identifying "
                     "phrases in query. For create-on-that-card instructions, put the prior item phrase "
                     "in reference_query. Resolve explicit dates to YYYY-MM-DD using the local time. "
                     "For relative durations such as two weeks, set offset_days. Never invent an action, "
-                    "destination, title, or date."
+                    "destination, title, or date. Example: 'Move all cards from INBOX to personal and "
+                    "assign a due date to all of October 29th' is one move action with scope=inbox_all, "
+                    "target_card=personal, and due_date set to October 29 of the relevant year. Example: "
+                    "'Transcendia push to October 29th' is set_due with query=Transcendia and "
+                    "scope=all_matching. Example: 'Tick complete on ask Ricky for bills. Set another "
+                    "checklist item on that card for Friday to follow up again' is a complete action plus "
+                    "a create action referencing the same original item."
                 ),
             },
             {
@@ -349,8 +404,47 @@ def parse_board_actions(text: str, card_names: list[str]) -> BoardActionBatch:
 
 
 def normalized_words(value: str) -> list[str]:
-    ignored = {"all", "the", "one", "items", "item", "stuff", "card", "cards", "on", "for"}
-    return [word for word in re.findall(r"[a-z0-9]+", value.lower()) if word not in ignored]
+    folded = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
+    ignored = {
+        "all", "the", "one", "items", "item", "stuff", "card", "cards",
+        "on", "for", "up", "to", "please", "again",
+    }
+    synonyms = {
+        "ask": "contact",
+        "chase": "contact",
+        "contact": "contact",
+        "follow": "contact",
+        "call": "contact",
+        "email": "contact",
+        "prep": "prepare",
+        "pre": "prepare",
+        "prepare": "prepare",
+    }
+    words = re.findall(r"[a-z0-9]+", folded.lower())
+    return [synonyms.get(word, word) for word in words if word not in ignored]
+
+
+def normalized_text(value: str) -> str:
+    return " ".join(normalized_words(value))
+
+
+def item_match_score(query: str, item: dict) -> float:
+    needle = normalized_text(query)
+    item_name = normalized_text(item["name"])
+    card_name = normalized_text(item["card_name"])
+    combined = f"{item_name} {card_name}".strip()
+    if needle == item_name:
+        return 1.0
+    if needle and needle in item_name:
+        return 0.96
+    query_words = set(needle.split())
+    combined_words = set(combined.split())
+    overlap = len(query_words & combined_words) / max(len(query_words), 1)
+    sequence = max(
+        SequenceMatcher(None, needle, item_name).ratio(),
+        SequenceMatcher(None, needle, combined).ratio(),
+    )
+    return max(sequence, overlap * 0.92)
 
 
 def resolve_items(query: str | None, scope: str, items: list[dict]) -> tuple[list[dict], str | None]:
@@ -360,40 +454,47 @@ def resolve_items(query: str | None, scope: str, items: list[dict]) -> tuple[lis
         return matches, None if matches else "No incomplete items were found on INBOX BOT."
     if not query:
         return [], "An item description is missing."
-    words = normalized_words(query)
-    if not words:
+    if not normalized_words(query):
         return [], f"‘{query}’ is too vague to match safely."
-    candidates = []
-    for item in incomplete:
-        haystack = f"{item['name']} {item['card_name']}".lower()
-        if all(word in haystack for word in words):
-            candidates.append(item)
-    if scope == "all_matching":
-        return candidates, None if candidates else f"No items matched ‘{query}’."
-    if len(candidates) == 1:
-        return candidates, None
-    if not candidates:
-        return [], f"No item matched ‘{query}’."
-    needle = " ".join(words)
     ranked = sorted(
-        candidates,
-        key=lambda item: SequenceMatcher(None, needle, f"{item['name']} {item['card_name']}".lower()).ratio(),
+        ((item_match_score(query, item), item) for item in incomplete),
+        key=lambda pair: pair[0],
         reverse=True,
     )
-    return [], f"‘{query}’ matched {len(ranked)} items; include more of the item name."
+    if scope == "all_matching":
+        candidates = [item for score, item in ranked if score >= 0.72]
+        return candidates, None if candidates else f"No items matched ‘{query}’."
+    if not ranked or ranked[0][0] < 0.58:
+        return [], f"No item matched ‘{query}’."
+    if len(ranked) == 1 or ranked[0][0] - ranked[1][0] >= 0.08:
+        return [ranked[0][1]], None
+    close = [item for score, item in ranked if ranked[0][0] - score < 0.08]
+    return [], f"‘{query}’ closely matched {len(close)} items; include more of the item name."
 
 
 def resolve_card(query: str | None, cards: list[dict]) -> tuple[dict | None, str | None]:
     if not query:
         return None, "A destination card is missing."
-    needle = query.strip().lower()
+    needle = normalized_text(query)
     open_cards = [card for card in cards if not card.get("closed")]
-    exact = [card for card in open_cards if card["name"].lower() == needle]
+    exact = [card for card in open_cards if normalized_text(card["name"]) == needle]
     if exact:
         return exact[0], None
-    partial = [card for card in open_cards if needle in card["name"].lower()]
+    partial = [card for card in open_cards if needle in normalized_text(card["name"])]
     if len(partial) == 1:
         return partial[0], None
+    ranked = sorted(
+        (
+            (SequenceMatcher(None, needle, normalized_text(card["name"])).ratio(), card)
+            for card in open_cards
+        ),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+    if ranked and ranked[0][0] >= 0.72 and (
+        len(ranked) == 1 or ranked[0][0] - ranked[1][0] >= 0.08
+    ):
+        return ranked[0][1], None
     return None, f"Destination ‘{query}’ did not uniquely match a card."
 
 
@@ -412,7 +513,22 @@ def build_action_plan(batch: BoardActionBatch, items: list[dict], cards: list[di
     previous_items: list[dict] = []
     for action in batch.actions:
         query = action.reference_query if action.action == "create" else action.query
-        matches, error = resolve_items(query, action.scope, items)
+        matches = []
+        error = None
+        # A short account/card name used with set_due means all incomplete
+        # checklist items on that card, even if the model marked it as single.
+        if action.action == "set_due" and action.scope == "single" and query:
+            account_card, card_error = resolve_card(query, cards)
+            if not card_error and account_card:
+                matches = [
+                    item
+                    for item in items
+                    if item["state"] != "complete" and item["card_id"] == account_card["id"]
+                ]
+                if not matches:
+                    error = f"No incomplete checklist items were found on ‘{account_card['name']}’."
+        if not matches and not error:
+            matches, error = resolve_items(query, action.scope, items)
         if action.action == "create" and not matches and previous_items and not action.reference_query:
             matches, error = previous_items[-1:], None
         if error:
@@ -599,6 +715,7 @@ def handle_trello_command(text: str, chat_id: int | None = None) -> str | None:
         batch = parse_board_actions(text, [card["name"] for card in cards])
         if not batch:
             return "I couldn’t parse those Trello instructions. Nothing was changed."
+        repair_missing_action_dates(batch, text)
         plans, errors = build_action_plan(batch, all_pipeline_items(), cards)
         if errors:
             details = "\n".join(f"• {error}" for error in errors)
