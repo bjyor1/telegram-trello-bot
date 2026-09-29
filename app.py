@@ -386,6 +386,21 @@ def requests_confirmation(text: str) -> bool:
     return looks_like_bot_output(text) and bool(re.search(r"(?:^|\n)\s*confirm(?:ed)?\s*$", lower))
 
 
+def telegram_capture_text(text: str) -> str | None:
+    patterns = (
+        r"^/add(?:@\w+)?\s*[:\-]?\s*",
+        r"^add\s+task\s*[:\-]\s*",
+        r"^add\s*[:\-]\s*",
+        r"^new\s+task\s*[:\-]\s*",
+        r"^capture\s*[:\-]\s*",
+    )
+    stripped = text.strip()
+    for pattern in patterns:
+        if re.match(pattern, stripped, flags=re.I):
+            return re.sub(pattern, "", stripped, count=1, flags=re.I).strip()
+    return None
+
+
 def parse_board_actions(text: str, card_names: list[str]) -> BoardActionBatch:
     timezone = ZoneInfo(os.getenv("BOT_TIMEZONE", "Australia/Melbourne"))
     now = datetime.now(timezone)
@@ -865,8 +880,9 @@ def telegram_webhook():
         if text and text.strip().startswith("/start"):
             send_telegram(
                 chat_id,
-                "I can capture tasks, brief you on PIPELINE, and update Trello.\n\n"
-                "Try: ‘What do I need to work on today?’ or ‘Push Send proposal to next Monday.’",
+                "I can brief you on PIPELINE and update Trello.\n\n"
+                "To create new tasks, use ‘/add Call John tomorrow’ or say ‘Add task: Call John tomorrow’ in a voice note.\n\n"
+                "For existing work, try: ‘What do I need to work on today?’ or ‘Push Send proposal to next Monday.’",
             )
             return jsonify(ok=True)
         if not text and message.get("voice"):
@@ -902,7 +918,19 @@ def telegram_webhook():
             )
             return jsonify(ok=True)
 
-        tasks = capture(text)
+        capture_text = telegram_capture_text(text)
+        if capture_text is None:
+            send_telegram(
+                chat_id,
+                "I didn’t recognize that as a Trello-management command, so I changed nothing. "
+                "To create new tasks, start with ‘/add’, ‘add task:’, or ‘capture:’. ",
+            )
+            return jsonify(ok=True)
+        if not capture_text:
+            send_telegram(chat_id, "Put the task after /add, for example: /add Call John tomorrow")
+            return jsonify(ok=True)
+
+        tasks = capture(capture_text)
         send_telegram(chat_id, confirmation(tasks))
     except Exception:
         logger.exception("Telegram capture failed")
