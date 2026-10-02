@@ -206,6 +206,21 @@ def pebble_capture():
 
     try:
         tasks = capture(transcription)
+
+        # Mirror Pebble captures back to Telegram so there is an immediate
+        # confirmation without needing to open Trello.
+        chat_id = env("TELEGRAM_ALLOWED_CHAT_ID", required=False)
+        if chat_id:
+            send_telegram(
+                int(chat_id),
+                f"🎙 Pebble transcription:\n{transcription}\n\n{confirmation(tasks)}",
+            )
+        else:
+            logger.warning(
+                "Pebble capture succeeded but TELEGRAM_ALLOWED_CHAT_ID is not set; "
+                "skipping Telegram confirmation"
+            )
+
         return jsonify(
             ok=True,
             tasks=[task.model_dump() for task in tasks],
