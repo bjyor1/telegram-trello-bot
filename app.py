@@ -187,6 +187,37 @@ def siri_capture():
         return jsonify(error="capture failed"), 502
 
 
+@app.route("/pebble", methods=["GET", "POST"])
+def pebble_capture():
+    if request.method == "GET":
+        return "Pebble capture endpoint is live", 200
+
+    expected = env("CAPTURE_SECRET")
+    supplied = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not supplied:
+        supplied = request.headers.get("X-CAPTURE-SECRET", "")
+    if supplied != expected:
+        return jsonify(error="unauthorized"), 401
+
+    # Pebble Index webhooks send multipart/form-data with the transcript in
+    # the "transcription" field. JSON fallback makes the endpoint easy to test.
+    payload = request.get_json(silent=True) or {}
+    transcription = request.form.get("transcription") or payload.get("transcription", "")
+
+    try:
+        tasks = capture(transcription)
+        return jsonify(
+            ok=True,
+            tasks=[task.model_dump() for task in tasks],
+            confirmation=confirmation(tasks),
+        )
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception:
+        logger.exception("Pebble capture failed")
+        return jsonify(error="capture failed"), 502
+
+
 @app.route("/telegram-webhook", methods=["GET", "POST"])
 def telegram_webhook():
     if request.method == "GET":
